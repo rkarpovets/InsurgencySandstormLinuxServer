@@ -5,12 +5,11 @@ import re
 import logging
 import signal
 import sys
-import asyncio
 from collections import OrderedDict
-from rcon.source import rcon
+from rcon.source import Client as RconClient
 
 from dotenv import load_dotenv
-load_dotenv("/home/steam/.env") # set your path or delete this import and use your values for variables under this comment
+load_dotenv("/home/steam/.env") # set your environment path or delete this import and use your values for variables under this comment
 
 LOG_FILE_PATH    = os.environ.get("LOG_FILE_PATH")
 MAPCYCLE_FILE    = os.environ.get("MAPCYCLE_FILE")
@@ -21,6 +20,7 @@ RCON_PASSWORD    = os.environ.get("RCON_PASSWORD")
 TRAVEL_COOLDOWN  = 30        # seconds to ignore further crash triggers after a travelscenario
 MAX_CACHE_SIZE   = 300       # max players kept in memory
 LOG_FILE         = "servermanager.log"
+RCON_TIMEOUT     = 5.0       # socket timeout in seconds
 
 # Logging
 logging.basicConfig(
@@ -34,17 +34,69 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # State
-player_cache: OrderedDict[str, str] = OrderedDict()   # steam_id to player_name
-_last_travel_time: float = 0.0                        # epoch seconds
+player_cache: OrderedDict[str, str] = OrderedDict()
+_last_travel_time: float = 0.0
+_rcon_client: RconClient | None = None
 
 
 # Graceful shutdown
 def _handle_signal(signum, _frame):
     log.info("Received signal %s — shutting down cleanly.", signal.Signals(signum).name)
+    _rcon_close()
     sys.exit(0)
 
 signal.signal(signal.SIGINT,  _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
+
+
+# RCON — persistent connection with auto-reconnect
+def _rcon_close() -> None:
+    global _rcon_client
+    if _rcon_client is not None:
+        try:
+            _rcon_client.close()
+        except Exception:
+            pass
+        _rcon_client = None
+
+
+def _rcon_connect() -> bool:
+    global _rcon_client
+    _rcon_close()
+    try:
+        client = RconClient(RCON_IP, RCON_PORT, passwd=RCON_PASSWORD, timeout=RCON_TIMEOUT)
+        client.connect(login=True)
+        _rcon_client = client
+        log.info("RCON connected to %s:%s.", RCON_IP, RCON_PORT)
+        return True
+    except Exception as e:
+        log.error("RCON connect failed: %s", e)
+        _rcon_client = None
+        return False
+
+
+def send_rcon(command: str) -> str | None:
+    """Send a command over the persistent RCON connection.
+    Attempts one reconnect if the connection is broken.
+    """
+    global _rcon_client
+
+    for attempt in range(2):          # 0 = try existing, 1 = after reconnect
+        if _rcon_client is None:
+            if not _rcon_connect():
+                return None
+
+        try:
+            result = _rcon_client.run(command)
+            log.debug("RCON ← %r  →  %r", command, result)
+            log.info("[RCON RESULT] %r", result)
+            return result
+        except Exception as e:
+            log.warning("RCON command %r failed (attempt %d): %s", command, attempt + 1, e)
+            _rcon_close()             # force reconnect on next iteration
+
+    log.error("RCON command %r gave up after 2 attempts.", command)
+    return None
 
 
 # Helpers
@@ -73,20 +125,10 @@ def load_maps() -> list[str]:
     return maps
 
 
-def send_rcon(command: str) -> str | None:
-    try:
-        result = asyncio.run(rcon(command, host=RCON_IP, port=RCON_PORT, passwd=RCON_PASSWORD))
-        log.debug("RCON ← %r  →  %r", command, result)
-        log.info("[RCON RESULT] %r", result)
-        return result
-    except Exception as e:
-        log.error("RCON command %r failed: %s", command, e)
-        return None
-
 def cache_add(steam_id: str, name: str) -> None:
     """Add a player to the cache, evicting oldest entries when over the limit."""
     if steam_id in player_cache:
-        del player_cache[steam_id]          # refresh position
+        del player_cache[steam_id]
     player_cache[steam_id] = name
     while len(player_cache) > MAX_CACHE_SIZE:
         evicted_id, evicted_name = player_cache.popitem(last=False)
@@ -173,6 +215,7 @@ def process_line(line: str, maps_pool: list[str]) -> None:
 
 def watch_logs() -> None:
     maps_pool = load_maps()
+    _rcon_connect()                   # establish connection at startup
     log.info("Monitoring: %s", LOG_FILE_PATH)
 
     while True:
