@@ -9,7 +9,9 @@ from collections import OrderedDict
 from rcon.source import Client as RconClient
 
 from dotenv import load_dotenv
-load_dotenv("/home/steam/.env") # set your environment path or delete this import and use your values for variables under this comment
+# Load env vars for manual runs. Under systemd they're already provided via
+# EnvironmentFile=, so override the path with ENV_FILE if yours differs.
+load_dotenv(os.environ.get("ENV_FILE", "/home/steam/.env"))
 
 LOG_FILE_PATH    = os.environ.get("LOG_FILE_PATH")
 MAPCYCLE_FILE    = os.environ.get("MAPCYCLE_FILE")
