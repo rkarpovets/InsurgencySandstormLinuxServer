@@ -4,7 +4,7 @@ source "$HOME/.env"
 set +a
 
 ./Insurgency/Binaries/Linux/InsurgencyServer-Linux-Shipping \
-  -ModDownloadTravelTo=Farmhouse?Scenario=Scenario_Farmhouse_Checkpoint_Insurgents?MaxPlayers=12 \
+  -ModDownloadTravelTo=Hold?Scenario=Scenario_Hold_Checkpoint_Security?MaxPlayers=12 \
   -Port=27000 \
   -QueryPort=27010 \
   -Rcon \
@@ -12,7 +12,7 @@ set +a
   -RconListenPort=$RCON_PORT \
   -SecurityCode=none \
   -log \
-  -hostname="[DE] CrazyStorm / ISMC / Insurgents only" \
+  -hostname="[DE] CrazyStorm / ISMC / Balanced AI" \
   -GSLTToken=$GSLT_TOKEN \
   -GameStats \
   -GameStatsToken=$GAMESTATS_TOKEN \

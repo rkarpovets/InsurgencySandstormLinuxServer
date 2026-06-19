@@ -3,10 +3,10 @@
 - ISMC Mod
 - Bots: 8 up to 32
 - Increased capture and defending time
-- Balanced AI
-- Insurgents only
-- Location: Germany
+- Modified AI difficulty
 
-Admins: A, Ascended To B.
+Location: Germany
+
+Admins: A, Ascended To B
 
 We need to focus, Al Ikhwan!
