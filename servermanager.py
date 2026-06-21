@@ -27,6 +27,9 @@ RCON_TIMEOUT     = 5.0       # socket timeout in seconds
 RCON_RETRIES     = 2         # connect+send attempts per command
 PRELOAD_MAX_BYTES = 50 * 1024 * 1024   # only scan the tail of the log on (re)open
 PRELOAD_MAX_LINES = 200_000            # secondary cap on tail lines scanned
+PLAYER_POLL_INTERVAL = 15   # seconds between listplayers reconciliations (leave detection)
+LEAVE_CONFIRM_POLLS  = 2    # consecutive absent polls before announcing a leave
+TRAVEL_RECONCILE_PAUSE = 30 # seconds to pause leave reconciliation after a map change
 
 # Logging
 logging.basicConfig(
@@ -41,7 +44,9 @@ log = logging.getLogger(__name__)
 
 # State
 player_cache: OrderedDict[str, str] = OrderedDict()
-_last_travel_time: float = 0.0
+_absent_streak: dict[str, int] = {}   # steam_id -> consecutive listplayers polls missing
+_last_travel_time: float = 0.0        # last crash-recovery travelscenario we issued
+_last_travel_seen: float = 0.0        # last ProcessServerTravel observed in the log
 
 
 # Graceful shutdown
@@ -183,6 +188,17 @@ def handle_login(line: str) -> bool:
     return True
 
 
+def handle_travel(line: str) -> bool:
+    """Note map changes so leave reconciliation can pause during the unstable
+    session-rebuild window."""
+    if "ProcessServerTravel" not in line:
+        return False
+    global _last_travel_seen
+    _last_travel_seen = time.monotonic()
+    log.debug("Map travel observed — pausing leave reconciliation briefly.")
+    return True
+
+
 def handle_join(line: str) -> bool:
     if "LogNet: Join succeeded:" not in line:
         return False
@@ -195,25 +211,52 @@ def handle_join(line: str) -> bool:
     return True
 
 
-def handle_disconnect(line: str) -> bool:
-    if "LogOnlineSession: Warning: STEAM (NWI): Player" not in line or "is not part of session" not in line:
-        return False
+def reconcile_players() -> None:
+    """Detect departures by reconciling the cache against RCON listplayers.
 
-    m = re.search(r'Player\s+(\d+)\s+is not part of session', line)
-    if m:
-        steam_id = m.group(1)
+    The server log's "Player X is not part of session" warning is NOT a reliable
+    leave signal: it repeats for still-connected players and fires for everyone
+    during map travel, which produced both false "disconnected" spam at map
+    changes and missed real departures. listplayers is the authoritative set of
+    who is actually connected, so we diff against it instead.
 
+    A player must be absent for LEAVE_CONFIRM_POLLS consecutive polls before we
+    announce a leave, so a momentarily truncated listplayers reply can't trigger
+    a false departure.
+    """
+    # During/just after a map change the session is rebuilding and listplayers
+    # can momentarily omit travelling players; don't reconcile in that window.
+    if time.monotonic() - _last_travel_seen < TRAVEL_RECONCILE_PAUSE:
+        return
+
+    result = send_rcon("listplayers")
+    if result is None or "NetID" not in result:
+        return                                  # RCON down or malformed reply
+
+    online = {sid: name for sid, name in parse_listplayers(result)}
+
+    for steam_id in list(player_cache.keys()):
+        if steam_id in online:
+            _absent_streak.pop(steam_id, None)
+            continue
+        streak = _absent_streak.get(steam_id, 0) + 1
+        if streak >= LEAVE_CONFIRM_POLLS:
+            _absent_streak.pop(steam_id, None)
+            name = cache_pop(steam_id)
+            log.info("[LEAVE] %s (%s)", name, steam_id)
+            send_rcon(f"say {name} disconnected")
+        else:
+            _absent_streak[steam_id] = streak
+
+    # Safety net: track present players we somehow missed, so their later
+    # departure is still caught (joins themselves are announced by handle_join).
+    for steam_id, name in online.items():
         if steam_id not in player_cache:
-            return True
-
-        name = cache_pop(steam_id)
-        log.info("[LEAVE] %s (%s)", name, steam_id)
-        send_rcon(f"say {name} disconnected")
-    return True
+            cache_add(steam_id, sanitize_name(name))
 
 
 # Main loop
-HANDLERS = [handle_crash, handle_login, handle_join, handle_disconnect]
+HANDLERS = [handle_crash, handle_travel, handle_login, handle_join]
 
 def process_line(line: str, maps_pool: list[str]) -> None:
     for handler in HANDLERS:
@@ -271,8 +314,13 @@ def watch_logs() -> None:
                 log.info("Cache pre-loaded: %d player(s).", len(player_cache))
 
                 current_inode = os.fstat(f.fileno()).st_ino
+                last_reconcile = time.monotonic()
 
                 while True:
+                    if time.monotonic() - last_reconcile >= PLAYER_POLL_INTERVAL:
+                        reconcile_players()
+                        last_reconcile = time.monotonic()
+
                     line = f.readline()
                     if not line:
                         time.sleep(0.5)
