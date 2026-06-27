@@ -16,3 +16,8 @@ Insurgency/Mods/
 
 __pycache__/
 *.bak.*
+
+# Engine-generated server configs (rewritten at runtime) - keep only hand-edited
+Insurgency/Saved/Config/LinuxServer/*
+!Insurgency/Saved/Config/LinuxServer/Game.ini
+!Insurgency/Saved/Config/LinuxServer/Engine.ini
