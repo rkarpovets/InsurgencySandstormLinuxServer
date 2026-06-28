@@ -2,9 +2,15 @@ import time
 import os
 import random
 import re
+import html
+import json
+import queue
 import logging
 import signal
 import sys
+import threading
+import urllib.parse
+import urllib.request
 from collections import OrderedDict
 from rcon.source import Client as RconClient
 
@@ -19,6 +25,20 @@ RCON_IP          = os.environ.get("RCON_IP")
 RCON_PORT        = int(os.environ.get("RCON_PORT"))
 RCON_PASSWORD    = os.environ.get("RCON_PASSWORD")
 
+# --- Game alerts (Telegram board + Grafana metric) — all optional ---
+# Leave the Telegram vars empty to disable alerts entirely (e.g. local tests).
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_GAME_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_GAME_CHAT_ID", "").strip()
+SERVER_NAME      = os.environ.get("SERVER_NAME", "Insurgency: Sandstorm")
+MAX_PLAYERS      = int(os.environ.get("MAX_PLAYERS", "16"))
+# Where to persist the pinned board's message_id so restarts edit it in place
+# instead of spamming a new board each time.
+BOARD_STATE_FILE = os.environ.get("BOARD_STATE_FILE", "board_message_id.txt")
+# node_exporter textfile-collector target. Empty → don't write the metric.
+METRICS_FILE     = os.environ.get("METRICS_FILE", "").strip()
+
+TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
+
 TRAVEL_COOLDOWN  = 30        # seconds to ignore further crash triggers after a travelscenario
 MAX_CACHE_SIZE   = 5000      # max players kept in memory (big enough that long-connected
                              # players are never evicted before they disconnect)
@@ -29,6 +49,10 @@ PRELOAD_MAX_BYTES = 50 * 1024 * 1024   # only scan the tail of the log on (re)op
 PRELOAD_MAX_LINES = 200_000            # secondary cap on tail lines scanned
 PLAYER_POLL_INTERVAL = 20   # seconds between periodic safety-net reconciliations
 TRAVEL_RECONCILE_PAUSE = 30 # seconds to pause leave reconciliation after a map change
+BOARD_DEBOUNCE   = 2.0      # seconds the Telegram worker coalesces rapid roster
+                            # changes into a single board edit (avoids API spam
+                            # when a full server reconnects after a map change)
+TG_HTTP_TIMEOUT  = 10.0     # seconds for any Telegram API call
 
 # Logging
 logging.basicConfig(
@@ -46,6 +70,14 @@ player_cache: OrderedDict[str, str] = OrderedDict()
 _leave_check_pending: bool = False    # a session warning asked for an immediate reconcile
 _last_travel_time: float = 0.0        # last crash-recovery travelscenario we issued
 _last_travel_seen: float = 0.0        # last ProcessServerTravel observed in the log
+
+# Game-alert state
+_current_map: str = "—"               # human map name (Scenario token, not the level)
+_prev_count: int = 0                  # player count at the last roster change (milestones)
+_last_event: str = ""                 # short text of the most recent join/leave
+_board_msg_id: int | None = None      # pinned Telegram board message to edit in place
+_board_dirty = threading.Event()      # set when the board needs a refresh
+_event_queue: "queue.Queue[str]" = queue.Queue()  # milestone/event messages to send
 
 
 # Graceful shutdown
@@ -178,6 +210,184 @@ def seed_cache_from_rcon() -> bool:
     return True
 
 
+# ============================================================================
+#  Game alerts: Telegram live board + Grafana metric
+#
+#  Design: the join/leave events already computed by handle_join /
+#  reconcile_players are the single source of truth. We only add two extra
+#  sinks here — never a second polling path:
+#    * a SINGLE pinned Telegram message ("board") edited in place on every
+#      roster/map change, plus short milestone lines on active/empty;
+#    * a node_exporter textfile metric (iss_players_online) for Grafana.
+#  All Telegram I/O happens on a dedicated worker thread so a slow/broken API
+#  call can never stall the RCON loop or log tailing.
+# ============================================================================
+
+def player_count() -> int:
+    return len(player_cache)
+
+
+def map_label() -> str:
+    return _current_map
+
+
+def _tg_call(method: str, params: dict) -> dict | None:
+    """POST to the Telegram Bot API. Returns the parsed response or None on
+    failure. Never raises — game monitoring must survive Telegram being down."""
+    if not TELEGRAM_ENABLED:
+        return None
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+    data = urllib.parse.urlencode(params).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data),
+                                    timeout=TG_HTTP_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log.warning("Telegram %s failed: %s", method, e)
+        return None
+
+
+def _load_board_id() -> None:
+    global _board_msg_id
+    try:
+        with open(BOARD_STATE_FILE, "r", encoding="utf-8") as f:
+            _board_msg_id = int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        _board_msg_id = None
+
+
+def _save_board_id(msg_id: int) -> None:
+    try:
+        with open(BOARD_STATE_FILE, "w", encoding="utf-8") as f:
+            f.write(str(msg_id))
+    except Exception as e:
+        log.warning("Could not persist board message id: %s", e)
+
+
+def build_board_text() -> str:
+    """Render the pinned status board (Telegram HTML parse mode)."""
+    count = player_count()
+    roster = "\n".join(f"• {html.escape(n)}" for n in player_cache.values()) or "<i>empty</i>"
+    last = f"\n\n<i>{html.escape(_last_event)}</i>" if _last_event else ""
+    return (
+        f"🎮 <b>{html.escape(SERVER_NAME)}</b>\n"
+        f"\n"
+        f"👥 Players: <b>{count}/{MAX_PLAYERS}</b>\n"
+        f"🗺️ Map: <b>{html.escape(map_label())}</b>\n"
+        f"\n"
+        f"{roster}"
+        f"{last}\n"
+        f"\n"
+        f"<i>updated {time.strftime('%H:%M:%S')}</i>"
+    )
+
+
+def _render_and_edit_board() -> None:
+    """Edit the pinned board in place; (re)create + pin it if needed."""
+    global _board_msg_id
+    text = build_board_text()
+    if _board_msg_id is not None:
+        r = _tg_call("editMessageText", {
+            "chat_id": TELEGRAM_CHAT_ID, "message_id": _board_msg_id,
+            "text": text, "parse_mode": "HTML",
+        })
+        # "message is not modified" is a benign no-op; anything else → recreate.
+        if r and (r.get("ok") or "not modified" in str(r.get("description", ""))):
+            return
+        log.info("Board edit failed (%s) — creating a new board.",
+                 r.get("description") if r else "no response")
+        _board_msg_id = None
+
+    r = _tg_call("sendMessage", {
+        "chat_id": TELEGRAM_CHAT_ID, "text": text,
+        "parse_mode": "HTML", "disable_notification": "true",
+    })
+    if r and r.get("ok"):
+        _board_msg_id = r["result"]["message_id"]
+        _save_board_id(_board_msg_id)
+        _tg_call("pinChatMessage", {
+            "chat_id": TELEGRAM_CHAT_ID, "message_id": _board_msg_id,
+            "disable_notification": "true",
+        })
+
+
+def notify_event(text: str) -> None:
+    """Queue a one-off milestone message (active/empty). Non-blocking."""
+    if TELEGRAM_ENABLED:
+        _event_queue.put(text)
+
+
+def telegram_worker() -> None:
+    """Single background thread: sends queued milestone messages and refreshes
+    the board at most every BOARD_DEBOUNCE seconds (coalesces bursts)."""
+    while True:
+        try:
+            while True:
+                msg = _event_queue.get_nowait()
+                _tg_call("sendMessage", {
+                    "chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML",
+                })
+        except queue.Empty:
+            pass
+        if _board_dirty.is_set():
+            _board_dirty.clear()
+            try:
+                _render_and_edit_board()
+            except Exception as e:
+                log.warning("Board update failed: %s", e)
+        time.sleep(BOARD_DEBOUNCE)
+
+
+def write_metrics() -> None:
+    """Atomically write the node_exporter textfile metric for Grafana."""
+    if not METRICS_FILE:
+        return
+    body = (
+        "# HELP iss_players_online Players currently connected\n"
+        "# TYPE iss_players_online gauge\n"
+        f"iss_players_online {player_count()}\n"
+        "# HELP iss_players_max Configured player slots\n"
+        "# TYPE iss_players_max gauge\n"
+        f"iss_players_max {MAX_PLAYERS}\n"
+        "# HELP iss_map_info Current map (value is always 1)\n"
+        "# TYPE iss_map_info gauge\n"
+        f'iss_map_info{{map="{_current_map}"}} 1\n'
+    )
+    tmp = f"{METRICS_FILE}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(body)
+        os.replace(tmp, METRICS_FILE)      # atomic — node_exporter never reads a partial file
+    except Exception as e:
+        log.warning("Could not write metrics file %s: %s", METRICS_FILE, e)
+
+
+def on_roster_change(event: str | None = None) -> None:
+    """Single entry point after any join/leave/safety-net change: fires
+    milestones, refreshes the board, and updates the Grafana metric."""
+    global _prev_count, _last_event
+    if event:
+        _last_event = event
+    count = player_count()
+    if _prev_count == 0 and count >= 1:
+        notify_event(f"🟢 <b>Server is now active</b>\n👥 {count}/{MAX_PLAYERS} · {html.escape(map_label())}")
+    elif _prev_count > 0 and count == 0:
+        notify_event("🔴 <b>Server is now empty</b>")
+    _prev_count = count
+    _board_dirty.set()
+    write_metrics()
+
+
+def init_roster_baseline() -> None:
+    """After startup pre-load: record the baseline count and publish the first
+    board/metric WITHOUT firing an 'active' milestone for already-connected
+    players (a restart shouldn't look like everyone just joined)."""
+    global _prev_count
+    _prev_count = player_count()
+    _board_dirty.set()
+    write_metrics()
+
+
 # Line handlers
 def handle_crash(line: str, maps_pool: list[str]) -> bool:
     """Detect map-vote crash and recover via travelscenario."""
@@ -210,13 +420,26 @@ def handle_login(line: str) -> bool:
     return True
 
 
+# ProcessServerTravel: <Level>?Scenario=Scenario_<Map>_<Mode>_<Side>?Game=<Mode>?
+# NOTE: the human map name is the Scenario token (e.g. "Tideway"), NOT the
+# level (e.g. "Buhriz") — they differ for several maps. The server is
+# Checkpoint-only, so we capture just the map and ignore the mode.
+_TRAVEL_RE = re.compile(r'Scenario=Scenario_([A-Za-z0-9]+)_')
+
+
 def handle_travel(line: str) -> bool:
-    """Note map changes so leave reconciliation can pause during the unstable
-    session-rebuild window."""
+    """Note map changes (pause leave reconciliation during the unstable
+    session-rebuild window) and capture the new map for the board."""
     if "ProcessServerTravel" not in line:
         return False
-    global _last_travel_seen
+    global _last_travel_seen, _current_map
     _last_travel_seen = time.monotonic()
+    m = _TRAVEL_RE.search(line)
+    if m:
+        _current_map = m.group(1)
+        log.info("[MAP] %s", _current_map)
+        _board_dirty.set()
+        write_metrics()
     log.debug("Map travel observed — pausing leave reconciliation briefly.")
     return True
 
@@ -230,6 +453,7 @@ def handle_join(line: str) -> bool:
         name = sanitize_name(m.group(1))
         log.info("[JOIN] %s", name)
         send_rcon(f"say {name} connected")
+        on_roster_change(f"🟢 {name} joined")
     return True
 
 
@@ -273,12 +497,14 @@ def reconcile_players() -> None:
                 name = cache_pop(steam_id)
                 log.info("[LEAVE] %s (%s)", name, steam_id)
                 send_rcon(f"say {name} disconnected")
+                on_roster_change(f"🔴 {name} left")
 
     # Safety net: track present players we somehow missed, so their later
     # departure is still caught (joins themselves are announced by handle_join).
     for steam_id, name in online.items():
         if steam_id not in player_cache:
             cache_add(steam_id, sanitize_name(name))
+            on_roster_change()      # refresh board/metric for the missed arrival
 
 
 def handle_session_warning(line: str) -> bool:
@@ -342,17 +568,51 @@ def preload_cache(f) -> None:
     preload_cache_from_tail(f)
 
 
+def seed_map_from_tail(f) -> None:
+    """Find the most recent map from the log tail so the board shows the right
+    map immediately on startup (before the next travel happens). Leaves the file
+    positioned back at EOF for tailing."""
+    global _current_map
+    try:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - 4 * 1024 * 1024))     # last 4 MB is plenty
+        last = None
+        for line in f:
+            if "ProcessServerTravel" in line:
+                last = line
+        if last:
+            m = _TRAVEL_RE.search(last)
+            if m:
+                _current_map = m.group(1)
+                log.info("Seeded current map from log: %s", _current_map)
+    except Exception as e:
+        log.debug("Map seed from tail skipped: %s", e)
+    finally:
+        f.seek(0, os.SEEK_END)             # always resume tailing from the end
+
+
 def watch_logs() -> None:
     global _leave_check_pending
     maps_pool = load_maps()
     log.info("Monitoring: %s", LOG_FILE_PATH)
+
+    if TELEGRAM_ENABLED:
+        _load_board_id()
+        threading.Thread(target=telegram_worker, daemon=True).start()
+        log.info("Telegram game alerts enabled (chat %s).", TELEGRAM_CHAT_ID)
+    else:
+        log.info("Telegram game alerts disabled (no token/chat set).")
 
     while True:
         try:
             with open(LOG_FILE_PATH, "r", encoding="utf-8", errors="ignore") as f:
                 log.info("Pre-loading player cache (RCON listplayers, tail fallback)...")
                 preload_cache(f)
-                log.info("Cache pre-loaded: %d player(s).", len(player_cache))
+                seed_map_from_tail(f)
+                init_roster_baseline()
+                log.info("Cache pre-loaded: %d player(s); map %s.",
+                         len(player_cache), map_label())
 
                 current_inode = os.fstat(f.fileno()).st_ino
                 last_reconcile = time.monotonic()
