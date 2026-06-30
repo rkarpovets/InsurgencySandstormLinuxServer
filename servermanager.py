@@ -279,7 +279,7 @@ def build_board_text() -> str:
         f"\n"
         f"{roster}\n"
         f"\n"
-        f"<i>updated {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} UTC</i>"
+        f"<i>updated {time.strftime('%-d %b %Y %H:%M', time.gmtime())} UTC</i>"
     )
 
 
